@@ -1,0 +1,82 @@
+name: Publish Release
+
+# Builds the Companion module package (.tgz) and publishes it on the repo's
+# Releases page whenever the version in package.json is raised and merged to master.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ~22.11
+
+      - name: Prepare environment
+        run: |
+          corepack enable
+          yarn install --immutable
+        env:
+          CI: true
+
+      - name: Check the version is new and higher than every earlier release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$VERSION' in package.json must look like 1.2.3"
+            exit 1
+          fi
+          # Highest version already published (empty if none yet).
+          HIGHEST=$(gh release list --limit 200 --json tagName --jq '.[].tagName' | sed 's/^v//' | sort -V | tail -n1)
+          if [ -n "$HIGHEST" ]; then
+            if [ "$VERSION" = "$HIGHEST" ] || [ "$(printf '%s\n%s\n' "$HIGHEST" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+              echo "::notice::Version $VERSION is not higher than the latest release ($HIGHEST), so nothing was published. Raise the version in package.json to publish a new package."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run checks
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          yarn check-types
+          yarn lint
+          yarn test
+        env:
+          CI: true
+
+      - name: Build Companion package
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          yarn build
+          yarn companion-module-build
+        env:
+          CI: true
+
+      - name: Publish release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          PKG=$(ls *.tgz | head -n1)
+          # Confirm the version inside the package matches the release number.
+          tar -xzOf "$PKG" pkg/companion/manifest.json | grep -q "\"version\":\"$VERSION\"" || { echo "::error::Package version does not match $VERSION"; exit 1; }
+          gh release create "v$VERSION" "$PKG" --title "v$VERSION" --latest --generate-notes
