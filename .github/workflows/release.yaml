@@ -1,11 +1,11 @@
 name: Publish Release
 
 # Builds the Companion module package (.tgz) and publishes it on the repo's
-# Releases page whenever the version in package.json is raised and merged to main.
+# Releases page whenever the version in package.json is raised and merged to master.
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   workflow_dispatch:
 
 permissions:
