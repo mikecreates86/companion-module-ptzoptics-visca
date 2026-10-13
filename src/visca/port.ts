@@ -13,6 +13,9 @@ const BLAME_MODULE =
 	"click the bug icon by any camera instance in the table in Companion's " +
 	'Connections tab to report it.'
 
+/** How long to wait before reconnecting after a VISCA protocol error. */
+const DefaultProtocolErrorRetryDelayMs = 10_000
+
 /** The type of a VISCA message sent to a camera. */
 export type MessageType = 'command' | 'inquiry'
 
@@ -326,6 +329,15 @@ export class VISCAPort {
 	#instance: PartialInstance
 
 	/**
+	 * A timer that will reopen the port after a VISCA protocol error closed it,
+	 * if one is pending.
+	 */
+	#protocolErrorRetryTimer: NodeJS.Timeout | null = null
+
+	/** How long to wait before reconnecting after a VISCA protocol error. */
+	readonly #protocolErrorRetryDelayMs: number
+
+	/**
 	 * Commmands *and* inquiries sent to the camera but that the camera hasn't
 	 * responded to yet (even by the half-response of a lone ACK).
 	 *
@@ -374,8 +386,9 @@ export class VISCAPort {
 	 * Create a VISCAPort associated with the provided instance.  The port is
 	 * initially closed and must be opened to be used.
 	 */
-	constructor(instance: PartialInstance) {
+	constructor(instance: PartialInstance, protocolErrorRetryDelayMs = DefaultProtocolErrorRetryDelayMs) {
 		this.#instance = instance
+		this.#protocolErrorRetryDelayMs = protocolErrorRetryDelayMs
 	}
 
 	/** True iff this port is currently closed. */
@@ -396,6 +409,11 @@ export class VISCAPort {
 	 *   The status to update the associated instance to.
 	 */
 	close(reason: string, status: InstanceStatus): void {
+		if (this.#protocolErrorRetryTimer !== null) {
+			clearTimeout(this.#protocolErrorRetryTimer)
+			this.#protocolErrorRetryTimer = null
+		}
+
 		const instance = this.#instance
 		let didClose = false
 		if (this.#socket !== null) {
@@ -574,13 +592,21 @@ export class VISCAPort {
 				// This is a transport-level failure where VISCA messages from
 				// the camera indicate some serious misunderstanding is afoot.
 				// Close the port (incidentally disconnecting the `'error'`
-				// handler above), and don't restart the connection: this could
-				// result in performing the exact action that triggered the
-				// transport-level failure, causing an infinite
-				// start-error-stop-restart loop.
+				// handler above).  Don't restart immediately: that could
+				// perform the exact action that triggered the transport-level
+				// failure in a tight start-error-stop-restart loop.  Instead
+				// retry after a pause, so a one-off garbled reply doesn't leave
+				// the camera disconnected until someone toggles the connection.
+				// (Closing or reopening the port in the meantime cancels this.)
 				const processingErrorReason = reason.message
 				this.#instance.log('error', processingErrorReason)
 				this.close(processingErrorReason, InstanceStatus.ConnectionFailure)
+
+				this.#instance.log('info', `Retrying connection in ${this.#protocolErrorRetryDelayMs / 1000} seconds`)
+				this.#protocolErrorRetryTimer = setTimeout(() => {
+					this.#protocolErrorRetryTimer = null
+					this.open(host, port)
+				}, this.#protocolErrorRetryDelayMs)
 			})
 			.finally(() => {
 				this.#instance.log('info', `Return message processing completed`)
